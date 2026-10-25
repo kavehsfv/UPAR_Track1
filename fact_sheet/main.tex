@@ -62,52 +62,48 @@ This is the fact sheet's template for the \href{https://vap.aau.dk/rws/challenge
 %
 
 \subsection{Title of the contribution}
-Fine-tuning a CLIP ViT-B/16 visual encoder with class-balanced weighted BCE for unified 40-attribute pedestrian attribute recognition.
+Fine-Tuning a CLIP ViT-B/16 Visual Encoder with Tempered Class-Balanced BCE and Coordinate-Ascent Logit Calibration for Unified Pedestrian Attribute Recognition.
 
 \subsection{Representative image / workflow diagram of the method}
-The pipeline is deliberately minimal. A pedestrian crop is letterboxed to $224\times224$ and normalized with CLIP statistics; the frozen ImageNet-style preprocessing is followed by the fine-tuned CLIP ViT-B/16 visual tower (12 transformer blocks, width 768, QuickGELU MLPs, class-token pooling, learned 512-d projection); a linear head maps the pooled embedding to 40 attribute logits; a fixed per-attribute bias vector (calibrated on the validation set) is added before the sigmoid to produce the final probabilities. The Codabench submission applies these probabilities directly with the fixed 0.5 threshold.
+A pedestrian crop is letterboxed to $224\times224$ with grey ($128$) padding and CLIP-normalized, then encoded by the fine-tuned CLIP ViT-B/16 visual tower~\cite{radford2021clip} ($12$ blocks, width $768$, QuickGELU, class-token pooling, $512$-d projection) and a linear head ($\mathbb{R}^{512}\to\mathbb{R}^{40}$) into raw attribute logits $\mathbf{z}\in\mathbb{R}^{40}$. Adding a validation-calibrated bias $\mathbf{b}\in\mathbb{R}^{40}$ yields final probabilities $\hat{\mathbf{p}}=\sigma(\mathbf{z}+\mathbf{b})$ for the challenge's fixed $0.5$ threshold.
 
 \subsection{Detailed method description}
-\textbf{Architecture.} We use the visual tower of OpenAI's CLIP ViT-B/16 (patch size 16, 12 blocks, embedding width 768, 12 heads, QuickGELU activations, class-token pooling followed by a learned projection to 512 dimensions), initialized from the public ``openai'' weights~\cite{radford2021clip}. A single linear layer maps the 512-d pooled image embedding to 40 attribute logits. The model is fully self-contained in the submission (plain PyTorch re-implementation of the ViT, no external dependencies beyond PyTorch and Pillow).
+\textbf{Architecture.} We adopt the visual tower of OpenAI CLIP ViT-B/16 ($16\times16$ patches, $12$ pre-norm Transformer blocks of width $768$ with $12$ heads and QuickGELU, class-token pooling, and a $768\times512$ projection) initialized from public \texttt{openai} weights~\cite{radford2021clip}, topped with a single linear layer ($\mathbb{R}^{512}\to\mathbb{R}^{40}$) for the $40$ UPAR attributes~\cite{Specker_2023_WACV,cormier2024upar}. The submission is implemented in pure PyTorch and Pillow with no external dependencies.
 
-\textbf{Training objective.} Training uses binary cross-entropy with a per-attribute positive weighting to counter the severe label imbalance across the 40 attributes (positive rates range from 0.2\% to 96.5\% on the training split). For attribute $a$ with training positive rate $p_a$, the pos-weight is
+\textbf{Training objective.} To counter extreme class imbalance on the training split (positive rates $p_a$ span $0.17\%$ for \texttt{LowerBody-Color-Purple} to $93.47\%$ for \texttt{Age-Adult}), we use binary cross-entropy with tempered positive-class weights:
 \begin{equation}
-w_a = \left(\frac{1-p_a}{p_a}\right)^{0.5},
+w_a = \left(\frac{1-p_a}{\max(p_a,\,10^{-6})}\right)^{0.5}, \qquad a \in \{1,\dots,40\},
 \end{equation}
-i.e., the square root of the inverse label ratio, which tames the extreme weights of the rarest attributes while still up-weighting them by up to two orders of magnitude.
+compressing weights to $[0.26,\,24.16]$ to boost rare-attribute recall without gradient instability.
 
-\textbf{Optimization.} AdamW with weight decay 0.05, differential learning rates (backbone $2\times10^{-5}$, classification head $1\times10^{-3}$), 500-iteration linear warmup followed by cosine decay, batch size 256 (accumulated to effective batches of 512 on a single 32\,GB GPU), 6 epochs, automatic mixed precision (bf16), and gradient-norm clipping at 1.0.
+\textbf{Optimization \& data.} We train exclusively on the UPAR training split ($97{,}669$ images: $10{,}000$ Market-1501, $79{,}001$ PA-100K, $8{,}668$ PETA) for $6$ epochs with batch size $256$ (\texttt{drop\_last=True}), AdamW (weight decay $0.05$), differential learning rates ($2\times10^{-5}$ backbone, $1\times10^{-3}$ head), $500$-step linear warmup plus cosine decay, $\text{bf16}$ AMP, and gradient-norm clipping at $1.0$. The validation split ($33{,}407$ images) is used solely to select the best checkpoint (epoch $2$, raw validation $\text{Challenge\_Avg}=0.8751$) and calibrate logit biases.
 
-\textbf{Data.} Training used only the predefined UPAR training split (97{,}669 crops: 10{,}000 Market1501, 79{,}001 PA100k, 8{,}668 PETA). The provided validation split was \emph{not} used for gradient updates; it was used only for checkpoint selection, per-attribute bias calibration, and local metric tracking.
-
-\textbf{Post-processing.} A per-attribute additive bias $b_a$ in logit space is tuned by coordinate ascent on the validation set to maximize the challenge metric (harmonic mean of mA and Instance\_F1). At inference the model returns $\sigma(z_a + b_a)$. This lifted validation Challenge\_Avg from 0.8751 to 0.8835 (mA 0.8717$\rightarrow$0.8941) with a small Instance\_F1 trade-off (0.8784$\rightarrow$0.8731).
-
-\textbf{Checkpoint selection.} The submitted weights are the epoch-2 checkpoint, selected on validation Challenge\_Avg (0.8751 raw, the best of all epochs of the final run).
+\textbf{Post-processing (coordinate-ascent logit calibration).} Since evaluation enforces a fixed $0.5$ threshold while ranking by $\text{Challenge\_Avg}$ (harmonic mean of $\text{mA}$ and $\text{Instance\_F1}$), we tune a $40$-d logit bias $\mathbf{b}\in[-3,3]^{40}$ (and temperature $T\in\{1,2\}$; $T=1$ optimal) on the validation set via $2$ coordinate-ascent sweeps over a $17$-point grid per attribute (step $0.375$). Predicting $\sigma(\mathbf{z}+\mathbf{b})$ implements per-attribute thresholds $\tau_a=\sigma(-b_a)$ under the $0.5$ rule ($32/40$ biases non-zero), lifting validation $\text{Challenge\_Avg}$ from $0.8751$ to $0.8835$ ($\text{mA}$: $0.8717\to0.8941$; $\text{Instance\_F1}$: $0.8784\to0.8731$).
 
 \subsection{Challenge results}
-Results of the latest submission on the Codabench leaderboard (test set, 36{,}343 images):
+Validation ($33{,}407$ images) and official test leaderboard ($36{,}343$ images) results:
 
 \begin{table}[h]
 \centering
-\begin{tabular}{l c}
+\begin{tabular}{l c c c}
 \hline
-Metric & Score \\
+Metric & Val (raw) & Val (cal.) & \textbf{Test (leaderboard)} \\
 \hline
-Challenge\_Avg & 0.7599 \\
-mA & 0.7716 \\
-Label\_F1 & 0.5341 \\
-Instance\_Acc & 0.6257 \\
-Instance\_Prec & 0.7152 \\
-Instance\_Rec & 0.8009 \\
-Instance\_F1 & 0.7486 \\
+\textbf{Challenge\_Avg} & 0.8751 & 0.8835 & \textbf{0.7599} \\
+mA & 0.8717 & 0.8941 & 0.7716 \\
+Label\_F1 & 0.7049 & 0.6673 & 0.5341 \\
+Instance\_Acc & 0.8001 & 0.7913 & 0.6257 \\
+Instance\_Prec & 0.8690 & 0.8494 & 0.7152 \\
+Instance\_Rec & 0.8953 & 0.9070 & 0.8009 \\
+Instance\_F1 & 0.8784 & 0.8731 & 0.7486 \\
 \hline
 \end{tabular}
 \end{table}
 
 \subsection{Final remarks}
-\textbf{Pros.} (i) A single, compact fine-tune of a strong general-purpose visual encoder reaches competitive accuracy without any PAR-specific architecture. (ii) The weighted-BCE exponent (0.5) and the validation-calibrated per-attribute biases give robust per-attribute balance, which benefits mA and Label\_F1 on rare attributes. (iii) The whole system is a self-contained plain-PyTorch file plus one weight file, which makes verification straightforward.
+\textbf{Pros.} (i) Fine-tuning a CLIP ViT-B/16 visual tower with a single linear head gives strong cross-domain features without part-localization branches. (ii) Tempered BCE weighting ($\gamma=0.5$) and coordinate-ascent logit calibration directly align predictions with the harmonic $\text{Challenge\_Avg}$ metric. (iii) Self-contained pure-PyTorch inference with batched $\text{bf16}$ execution.
 
-\textbf{Cons.} (i) The gap between validation (Challenge\_Avg 0.8835) and test (0.7599) indicates distribution shift between the splits and/or mild over-calibration to the validation set; the bias calibration in particular may have overfit the validation distribution. (ii) No ensemble or test-time augmentation was used; both typically add 1--2 points. (iii) Rare attributes (e.g., purple/yellow/orange lower-body clothing colors) remain the dominant error source.
+\textbf{Cons.} (i) The validation-to-test drop ($0.8835\to0.7599$) reflects domain shift and mild bias-calibration overfitting to validation priors (trading $\text{Label\_F1}$ precision for $\text{mA}$ recall). (ii) No ensembling or test-time augmentation. (iii) Rare color attributes remain the main error source.
 
 \section{Additional method details}
 Please, reply if your challenge entry considered (or not) the following strategies and provide a brief explanation. For each question, mark with X one single option. \\
@@ -119,62 +115,62 @@ Please, reply if your challenge entry considered (or not) the following strategi
 \begin{itemize}
 %------------------------------------
 \item \textbf{For the competition track associated with this fact sheet, you confirm that you have trained your model on the predefined datasets} (X)~Yes, (~)~No\\
-Training used only the predefined UPAR training split (Market1501 + PA100k + PETA crops, 97{,}669 images). No other pedestrian data was used for training.
+Trained strictly on the predefined UPAR training split ($97{,}669$ images: Market-1501, PA-100K, PETA).
 %------------------------------------
 
 %------------------------------------
 \item \textbf{Did you use any pre-trained model:} (X)~Yes, (~)~No.\\ If yes, please detail (e.g., model architecture, training strategy, train data, etc.).\\
 %
-The visual tower of OpenAI CLIP ViT-B/16 (public ``openai'' weights via open\_clip\_torch) was used as initialization. CLIP was trained on Web-scale image--text pairs (WIT-400M); we use only its ImageNet-like visual encoder weights, fine-tune all layers, and do not use any text encoder, prompts, or language supervision at any stage of our pipeline.
+Initialized from the OpenAI CLIP ViT-B/16 visual tower (\texttt{openai} weights via \texttt{open\_clip\_torch}, WIT-400M~\cite{radford2021clip}), fine-tuned end-to-end with a linear head ($\mathbb{R}^{512}\to\mathbb{R}^{40}$).
 %------------------------------------
 
 %------------------------------------
 \item \textbf{Did you use external data?} (~)~Yes, (X)~No\\
 If yes, please detail:\\
 %
-Only the CLIP initialization weights (a foundation-model prior, not PAR-specific data). No pedestrian-attribute datasets, pseudo-labels, or additional images beyond the provided splits were used.
+No external images, annotations, or pseudo-labels beyond the public CLIP initialization weights.
 %------------------------------------
 
 %------------------------------------
 \item \textbf{Did you perform any data augmentation?} \\(X)~Yes, (~)~No\\
 If yes, please detail:\\
 %
-Random horizontal flip (p=0.5) and random erasing of a grey rectangle (p=0.25, rectangle size between 1/8 and 1/3 of each side), applied after letterbox resizing. The grey value equals the normalized zero (mean) value, matching padding semantics.
+Random horizontal flip ($p=0.5$) and tensor-space random erasing ($p=0.25$, rectangle size $\in[1/8,1/3)$ per side filled with $0.0$, the normalized CLIP mean).
 %------------------------------------
 
 %------------------------------------
 \item \textbf{Did you use the provided validation set as part of your training set?} (~)~Yes, (X)~No\\
 If yes, please detail:\\
 %
-The validation set was never used for gradient updates. It was used for (i) checkpoint selection (best epoch by Challenge\_Avg), (ii) per-attribute bias calibration (coordinate ascent on 40 bias values), and (iii) local metric reporting. All gradients came exclusively from the 97{,}669 training crops.
+Never used for gradient updates; used only for epoch-$2$ checkpoint selection and post-hoc logit-bias calibration.
 %------------------------------------
 
 %------------------------------------
-\item \textbf{Did you use any regularization strategies/terms?} (~)~Yes, (X)~No\\
+\item \textbf{Did you use any regularization strategies/terms?} (X)~Yes, (~)~No\\
 If yes, please detail:\\
 %
-Weight decay 0.05 (AdamW) on all parameters; gradient-norm clipping at 1.0; random erasing augmentation (see above). No dropout, label smoothing, or auxiliary losses.
+AdamW weight decay ($0.05$), gradient $\ell_2$-norm clipping at $1.0$, random erasing ($p=0.25$), and early stopping at epoch $2$.
 %------------------------------------
 
 %------------------------------------
 \item \textbf{Did you use any pre-processing steps?} (X)~Yes, (~)~No\\
 If yes, please detail:\\
 %
-Aspect-ratio-preserving letterbox resize to $224\times224$ with grey (128) padding, followed by CLIP channel normalization (mean $(0.481, 0.458, 0.408)$, std $(0.269, 0.261, 0.276)$). Bilinear interpolation.
+Aspect-ratio-preserving bilinear letterbox resize to $224\times224$ with grey ($128$) padding and CLIP normalization ($\mu=(0.4815, 0.4578, 0.4082)$, $\sigma=(0.2686, 0.2613, 0.2758)$).
 %------------------------------------
 
 %------------------------------------
 \item \textbf{Did you use any post-processing steps?} (X)~Yes, (~)~No\\
 If yes, please detail:\\
 %
-Per-attribute additive bias in logit space, calibrated on the validation set by coordinate ascent maximizing the challenge metric (harmonic mean of mA and Instance\_F1); 2 sweeps over a grid of 17 bias values per attribute in $[-3, 3]$. At inference: $\sigma(z_a + b_a)$, thresholded at 0.5.
+Per-attribute logit bias $\mathbf{b}\in[-3,3]^{40}$ tuned via $2$-sweep coordinate ascent ($17$-point grid, $T=1.0$) on validation $\text{Challenge\_Avg}$; inference outputs $\sigma(\mathbf{z}+\mathbf{b})$ thresholded at $0.5$.
 %------------------------------------
 
 %------------------------------------
-\item \textbf{Did you use Vision Language Models (VLMs) of any kind?} (~)~Yes, (X)~No\\
+\item \textbf{Did you use Vision Language Models (VLMs) of any kind?} (X)~Yes, (~)~No\\
 If yes, please detail:\\
 %
-No. Although the encoder originates from a vision--language pre-training (CLIP), our pipeline uses only its visual tower as an image encoder; no text prompts, no text encoder, no zero-shot classification, and no language supervision were involved in training or inference for this track.
+Only the visual tower of CLIP ViT-B/16~\cite{radford2021clip} is used as an image backbone; the text encoder and language supervision are unused.
 %------------------------------------
 \end{itemize}
 
@@ -182,7 +178,7 @@ No. Although the encoder originates from a vision--language pre-training (CLIP),
 \section{Code repository}
 Link to a code repository with complete and detailed instructions so that the results obtained on Codabench can be reproduced locally. This includes a list of requirements, pre-trained models, and so on. Note, training code with instructions is also required. This is required for all participants to appear in the final ranking. \textbf{Organizers strongly encourage the use of docker to facilitate reproducibility}. \\
 
-\textbf{Code repository:} \url{http://your_link_here}
+\textbf{Code repository:} \url{https://github.com/kavehsfv/UPAR_Track1}
 
 
 \bibliographystyle{IEEEtran}
